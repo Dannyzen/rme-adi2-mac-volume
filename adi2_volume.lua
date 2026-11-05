@@ -361,7 +361,6 @@ function M:start()
     end)
     self.eventTap:start()
 
-    print("✅ ADI-2 DAC hardware MIDI volume control active.")
     return self
 end
 

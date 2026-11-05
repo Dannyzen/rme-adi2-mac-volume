@@ -19,9 +19,13 @@ echo "✓ Copied adi2_volume.lua to ${TARGET_LUA}"
 
 if ! [ -f "${INIT_LUA}" ]; then
     cat << 'EOF' > "${INIT_LUA}"
+hs.logger.defaultLogLevel = "nothing"
 hs.allowAppleScript(true)
 require("hs.ipc")
 require("adi2_volume")
+hs.console.clearConsole()
+local cwin = hs.console.hswindow()
+if cwin then cwin:close() end
 EOF
     echo "✓ Created ${INIT_LUA}"
 else
@@ -33,8 +37,8 @@ else
     fi
 fi
 
-# Ensure Hammerspoon is running and reload config
-open -a Hammerspoon
+# Ensure Hammerspoon is running in background without opening the Console window
+pgrep -x Hammerspoon >/dev/null 2>&1 || open -g -a Hammerspoon
 sleep 0.5
 osascript -e 'tell application "Hammerspoon" to execute lua code "hs.reload()"' >/dev/null 2>&1 || true
 sleep 1.2
