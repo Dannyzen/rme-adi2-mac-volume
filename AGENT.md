@@ -33,15 +33,11 @@ Verify that the ADI-2 DAC is connected and exposes **Interface 4** (`bInterfaceC
   - `bInterfaceNumber = 4`: `bInterfaceClass = 1, bInterfaceSubClass = 3` (`MIDIServer` CoreMIDI endpoint)
 - **If Interface 4 is missing:** The DAC either needs a firmware update via `fut_madiface_mac.zip` (Firmware >= 62) or needs `MIDI Control` toggled `ON` on the hardware front panel.
 
-### 2.2 Hammerspoon & IPC Check
-Verify Hammerspoon is installed, running, and AppleScript IPC is enabled (`hs.allowAppleScript(true)` in `~/.hammerspoon/init.lua`):
-
-```bash
-osascript -e 'tell application "Hammerspoon" to execute lua code "return hs.inspect(hs.midi.devices())"'
-```
-
-- **Expected Output:** Must include `"ADI-2 DAC (<serial>)"`, e.g.:
-  `{ "Bluetooth", "Network", "UMP Network", "ADI-2 DAC (59920649)" }`
+### 2.2 Architecture: Why `adi2_midi_helper.c` Instead of `hs.midi`
+- **Critical Caveat (`DO NOT USE hs.midi`):** Hammerspoon's built-in `hs.midi` module wraps `MIKMIDI`, which suffers from an unsigned integer underflow inside `MIDIPacketListAdd` -> `_platform_memmove` (`Thread stack size exceeded` / `SIGBUS`) on CoreMIDI's background receive pthread when a USB MIDI device resets mid-SysEx during macOS sleep/wake.
+- **Solution (`adi2_midi_helper.c`):** All CoreMIDI communication runs in `~/.hammerspoon/bin/adi2_midi_helper`, a standalone C binary compiled directly against `<CoreMIDI/CoreMIDI.h>` with fixed static SysEx reassembly buffers, strict packet bounds checks, and deduplicated 1 Hz status heartbeats.
+- **IPC Pipe (`hs.task`):** `adi2_volume.lua` spawns `adi2_midi_helper` via `hs.task` and exchanges newline-delimited commands (`SET <addr> <idx> <val>`, `SYNC`) and state events (`CONNECTED <model>`, `DISCONNECTED`, `ACTIVE <addr>`, `PARAM <addr> <idx> <val>`) over `stdin`/`stdout`. When Hammerspoon reloads or exits, `STDIN_FILENO` closes (`read == 0`) and `adi2_midi_helper` exits cleanly (`exit(0)`).
+- **Process Supervision (`launchd`):** `~/Library/LaunchAgents/org.hammerspoon.Hammerspoon.keepalive.plist` supervises Hammerspoon with `RunAtLoad = true` and `KeepAlive = { Crashed = true, SuccessfulExit = false }`.
 
 ### 2.3 Active Audio Output Check
 Verify that the ADI-2 DAC is set as the macOS Default Output Device:
@@ -121,20 +117,22 @@ Run the idempotent installer:
 ```
 
 ### 4.2 Manual / Programmatic Install
-1. Copy `adi2_volume.lua` to `~/.hammerspoon/adi2_volume.lua`.
-2. Ensure `~/.hammerspoon/init.lua` contains:
+1. Compile `adi2_midi_helper.c`:
+   ```bash
+   mkdir -p ~/.hammerspoon/bin
+   clang -O2 -Wall -Wextra adi2_midi_helper.c -framework CoreMIDI -framework CoreFoundation -o ~/.hammerspoon/bin/adi2_midi_helper
+   ```
+2. Copy `adi2_volume.lua` to `~/.hammerspoon/adi2_volume.lua`.
+3. Ensure `~/.hammerspoon/init.lua` contains:
    ```lua
    hs.allowAppleScript(true)
    require("hs.ipc")
    require("adi2_volume")
    ```
-3. Reload Hammerspoon:
-   ```bash
-   osascript -e 'tell application "Hammerspoon" to execute lua code "hs.reload()"'
-   ```
+4. Install `org.hammerspoon.Hammerspoon.keepalive.plist` into `~/Library/LaunchAgents/` and load via `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.hammerspoon.Hammerspoon.keepalive.plist`.
 
 ### 4.3 Live State Verification
-Verify that `ADI2Volume` is loaded, connected to CoreMIDI, synced with the DAC's current dB state, and has its `hs.eventtap` enabled:
+Verify that `ADI2Volume` is loaded, `adi2_midi_helper` is running and connected to CoreMIDI, synced with the DAC's current dB state, and has its `hs.eventtap` enabled:
 
 ```bash
 osascript -e 'tell application "Hammerspoon" to execute lua code "
@@ -142,6 +140,7 @@ return hs.inspect({
     device = ADI2Volume.midiDeviceName,
     activeAddr = ADI2Volume.activeAddr,
     channels = ADI2Volume.channels,
+    helperRunning = ADI2Volume.helperTask and ADI2Volume.helperTask:isRunning(),
     isDefault = ADI2Volume:isADI2DefaultOutput(),
     tapEnabled = ADI2Volume.eventTap and ADI2Volume.eventTap:isEnabled()
 })

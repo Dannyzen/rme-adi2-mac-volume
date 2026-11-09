@@ -18,15 +18,17 @@ The downside is that **macOS disables your keyboard's `F10` / `F11` / `F12` volu
 
 ## How This Fixes It (Without Losing Bit-Perfect Audio)
 
-Instead of routing your audio through a lossy virtual software mixer, this project uses **Hammerspoon** (`hs.midi` + `hs.eventtap`) to talk directly to the **RME ADI-2 DAC's built-in MIDI remote protocol** (the exact same USB MIDI SysEx protocol used by RME's official **ADI-2 Remote** app):
+Instead of routing your audio through a lossy virtual software mixer, this project pairs **Hammerspoon** (`hs.eventtap` + `hs.canvas`) with a tiny, memory-safe native C **CoreMIDI helper** (`adi2_midi_helper.c`) to talk directly to the **RME ADI-2 DAC's built-in MIDI remote protocol** (the exact same USB MIDI SysEx protocol used by RME's official **ADI-2 Remote** app):
 
 - **Turns the actual hardware volume on the DAC:** Pressing Volume Up/Down on your Mac keyboard changes the real `dB` value on the ADI-2 DAC's front OLED display and triggers hardware **Auto Ref Level** relays.
 - **Two-way real-time sync:**
   - If you turn the physical volume knob on the ADI-2 DAC or drag the slider in **ADI-2 Remote.app**, Hammerspoon instantly updates its internal state.
   - If you press Volume Up/Down/Mute on your keyboard, both the physical DAC screen and the **ADI-2 Remote** app update simultaneously.
-- **Smart Output Detection (`Line Out` / `Phones` / `IEM`):** Reads the DAC's live status heartbeat every second so your keyboard automatically controls whichever output (`Line Out`, `Phones`, or `IEM`) is currently active on the DAC.
+- **Smart Output Detection (`Line Out` / `Phones` / `IEM`):** Reads the DAC's live status heartbeat in C (filtering redundant heartbeats so Hammerspoon stays at 0% idle CPU) and automatically controls whichever output (`Line Out`, `Phones`, or `IEM`) is currently active on the DAC.
+- **Sleep/Wake, Crash & KVM Resilient:**
+  - Bypasses Hammerspoon's built-in `hs.midi` (`MIKMIDI`), which has a known `MIDIPacketListAdd` stack-overflow crash when USB MIDI resets on macOS wake-from-sleep.
+  - Installs a `launchd` `KeepAlive` LaunchAgent (`org.hammerspoon.Hammerspoon.keepalive.plist`) so Hammerspoon starts automatically at login and auto-restarts within seconds if it is ever killed.
 - **Passthrough for Other Audio Devices:** Only intercepts volume keys when **ADI-2 DAC** is your active macOS Default Output Device. If you switch to **MacBook Pro Speakers** or **AirPods**, native macOS volume keys work as usual.
-- **KVM & Hotplug Resilient:** Automatically reconnects when switching a USB KVM (e.g., TESmart) or power-cycling the DAC.
 - **Native-Style On-Screen HUD:** Displays a bottom-center HUD pill showing the active channel (`ADI-2 DAC • Line Out` or `Phones`) and exact hardware `dB` level.
 
 ---
@@ -74,9 +76,10 @@ chmod +x install.sh
 ```
 
 ### What `install.sh` Does
-1. Copies `adi2_volume.lua` to `~/.hammerspoon/adi2_volume.lua`.
-2. Ensures `require("adi2_volume")` is present in `~/.hammerspoon/init.lua`.
-3. Reloads Hammerspoon and verifies that `ADI-2 DAC` is connected over CoreMIDI.
+1. Compiles `adi2_midi_helper.c` with `clang` to `~/.hammerspoon/bin/adi2_midi_helper`.
+2. Copies `adi2_volume.lua` to `~/.hammerspoon/adi2_volume.lua` and ensures `require("adi2_volume")` is in `~/.hammerspoon/init.lua`.
+3. Installs and loads `~/Library/LaunchAgents/org.hammerspoon.Hammerspoon.keepalive.plist` so Hammerspoon starts at login and auto-restarts if it ever crashes.
+4. Verifies live CoreMIDI state synchronization with the ADI-2 DAC.
 
 ---
 

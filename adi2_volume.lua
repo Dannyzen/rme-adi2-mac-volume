@@ -1,15 +1,10 @@
 -- ~/.hammerspoon/adi2_volume.lua
 -- Direct hardware volume & mute control for RME ADI-2 DAC via USB MIDI SysEx.
--- Syncs bidirectionally with the physical DAC knob and RME ADI-2 Remote.app.
+-- Uses a dedicated C CoreMIDI helper (~/.hammerspoon/bin/adi2_midi_helper) instead of hs.midi
+-- to avoid MIKMIDI's sleep/wake MIDIPacketListAdd stack-overflow crash.
 
 local M = {}
 
--- Clean up any previous instance or test globals on reload
-if _G.TestMidi then
-    pcall(function() _G.TestMidi:callback(nil) end)
-    _G.TestMidi = nil
-    _G.TestMidiLog = nil
-end
 if _G.ADI2Volume then
     pcall(function() _G.ADI2Volume:stop() end)
 end
@@ -20,15 +15,11 @@ local CHANNEL_NAMES = {
     [9] = "IEM",
 }
 
--- Map status byte6 (bits 1..0) to channel address
-local ACTIVE_OUT_TO_ADDR = {
-    [0] = 3, -- Line Out
-    [1] = 6, -- Phones
-    [2] = 9, -- IEM
-}
-
-M.midiDevice = nil
+M.HELPER_PATH = os.getenv("HOME") .. "/.hammerspoon/bin/adi2_midi_helper"
+M.helperTask = nil
 M.midiDeviceName = nil
+M.stdoutBuf = ""
+
 M.activeAddr = 3 -- Default to Line Out (addr 3)
 M.channels = {
     [3] = { vol = -150, muted = false }, -- vol in 0.1 dB units (-150 = -15.0 dB)
@@ -42,116 +33,112 @@ M.MAX_VOL = 0     -- Cap keyboard volume at 0.0 dB for safety (hardware goes to 
 M.hudCanvas = nil
 M.hudTimer = nil
 M.eventTap = nil
-M.usbWatcher = nil
+M.sleepWatcher = nil
+M.watchdogTimer = nil
+M.stopping = false
 
--- Encode a 3-byte RME parameter container for channel settings (addr 3, 6, 9)
-local function encodeChannelParam(addr, index, val)
-    local raw12 = val < 0 and (4096 + val) or val
-    raw12 = math.max(0, math.min(4095, math.floor(raw12 + 0.5)))
-    local b1 = ((addr & 0x0F) << 3) | ((index >> 2) & 0x07)
-    local b2 = ((index & 0x03) << 5) | ((raw12 >> 7) & 0x1F)
-    local b3 = raw12 & 0x7F
-    return string.format("%02x%02x%02x", b1, b2, b3)
-end
+-- Parse a single line from adi2_midi_helper stdout
+function M:handleHelperLine(line)
+    if not line or line == "" then return end
 
--- Send a parameter to the ADI-2 DAC (Device ID 0x71, Command 0x02)
-function M:sendParam(addr, index, val)
-    if not self.midiDevice then
-        if not self:connectMidi() then return false end
-    end
-    local container = encodeChannelParam(addr, index, val)
-    local sysex = "f000200d7102" .. container .. "f7"
-    self.midiDevice:sendSysex(sysex)
-    return true
-end
-
--- Request full state dump from ADI-2 DAC (Command 0x03 0x09)
-function M:requestAllSettings()
-    if self.midiDevice then
-        self.midiDevice:sendSysex("f000200d710309f7")
-    end
-end
-
--- Parse incoming SysEx strings from hs.midi
-function M:handleSysex(hexStr)
-    if not hexStr or #hexStr < 8 then return end
-    local clean = hexStr:gsub("%s+", ""):lower()
-    -- hs.midi strips leading f000 and trailing f7 on 3-byte manufacturer IDs,
-    -- but handle both stripped ("200d71...") and full ("f000200d71...") formats
-    if clean:sub(1, 4) == "f000" then
-        clean = clean:sub(5)
-    end
-    if clean:sub(-2) == "f7" then
-        clean = clean:sub(1, -3)
+    local connectedModel = line:match("^CONNECTED%s+(.+)$")
+    if connectedModel then
+        self.midiDeviceName = connectedModel
+        return
     end
 
-    local prefix = clean:sub(1, 8)
-    if prefix == "200d7101" or prefix == "200d7102" then
-        -- 3-byte parameter containers
-        for i = 9, #clean - 5, 6 do
-            local b1 = tonumber(clean:sub(i, i + 1), 16)
-            local b2 = tonumber(clean:sub(i + 2, i + 3), 16)
-            local b3 = tonumber(clean:sub(i + 4, i + 5), 16)
-            if b1 and b2 and b3 then
-                local addr = (b1 >> 3) & 0x0F
-                if self.channels[addr] then
-                    local idx = ((b1 & 0x07) << 2) | ((b2 >> 5) & 0x03)
-                    local raw12 = ((b2 & 0x1F) << 7) | (b3 & 0x7F)
-                    local val = raw12 >= 2048 and (raw12 - 4096) or raw12
-                    if idx == 12 then
-                        self.channels[addr].vol = val
-                    elseif idx == 15 then
-                        self.channels[addr].muted = (val ~= 0)
-                    end
-                end
-            end
-        end
-    elseif prefix == "200d7107" and #clean >= 10 then
-        -- Periodic status message: byte 6 bits 1..0 indicate active DAC output
-        local b6 = tonumber(clean:sub(9, 10), 16)
-        if b6 then
-            local activeOut = b6 & 0x03
-            local mappedAddr = ACTIVE_OUT_TO_ADDR[activeOut]
-            if mappedAddr then
-                self.activeAddr = mappedAddr
-            end
-        end
-    end
-end
-
--- Connect (or reconnect) to ADI-2 DAC MIDI device
-function M:connectMidi()
-    local devices = hs.midi.devices() or {}
-    local targetName = nil
-    for _, name in ipairs(devices) do
-        if name:match("^ADI%-2 DAC") then
-            targetName = name
-            break
-        end
-    end
-    if not targetName then
-        self.midiDevice = nil
+    if line == "DISCONNECTED" then
         self.midiDeviceName = nil
-        return false
+        return
     end
-    if self.midiDevice and self.midiDeviceName == targetName then
+
+    local activeStr = line:match("^ACTIVE%s+(%d+)$")
+    if activeStr then
+        local addr = tonumber(activeStr)
+        if addr and self.channels[addr] then
+            self.activeAddr = addr
+        end
+        return
+    end
+
+    local addrStr, idxStr, valStr = line:match("^PARAM%s+(%d+)%s+(%d+)%s+(-?%d+)$")
+    if addrStr and idxStr and valStr then
+        local addr = tonumber(addrStr)
+        local idx = tonumber(idxStr)
+        local val = tonumber(valStr)
+        if addr and self.channels[addr] then
+            if idx == 12 and val then
+                self.channels[addr].vol = val
+            elseif idx == 15 and val then
+                self.channels[addr].muted = (val ~= 0)
+            end
+        end
+    end
+end
+
+-- Process streaming stdout chunks from hs.task
+function M:onHelperOutput(chunk)
+    if not chunk or chunk == "" then return end
+    self.stdoutBuf = self.stdoutBuf .. chunk
+    while true do
+        local nl = self.stdoutBuf:find("\n", 1, true)
+        if not nl then break end
+        local line = self.stdoutBuf:sub(1, nl - 1):gsub("\r$", "")
+        self.stdoutBuf = self.stdoutBuf:sub(nl + 1)
+        self:handleHelperLine(line)
+    end
+end
+
+-- Start (or restart) the persistent C CoreMIDI helper process
+function M:startHelper()
+    if self.helperTask and self.helperTask:isRunning() then
         return true
     end
 
-    local dev = hs.midi.new(targetName)
-    if not dev then return false end
+    self.helperTask = nil
+    self.midiDeviceName = nil
+    self.stdoutBuf = ""
 
-    self.midiDevice = dev
-    self.midiDeviceName = targetName
-    dev:callback(function(_, _, cmdType, _, metadata)
-        if cmdType == "systemExclusive" and metadata and metadata.sysexData then
-            self:handleSysex(metadata.sysexData)
+    local task = hs.task.new(
+        self.HELPER_PATH,
+        function()
+            -- Termination callback: auto-respawn unless module is stopping
+            self.helperTask = nil
+            self.midiDeviceName = nil
+            if not self.stopping then
+                hs.timer.doAfter(1.0, function()
+                    if not self.stopping then self:startHelper() end
+                end)
+            end
+        end,
+        function(_, stdOut, _)
+            if stdOut then self:onHelperOutput(stdOut) end
+            return true
         end
-    end)
+    )
 
-    -- Query initial volume & mute settings
-    self:requestAllSettings()
+    if not task then return false end
+    if not task:start() then return false end
+    self.helperTask = task
     return true
+end
+
+-- Send a parameter to the ADI-2 DAC via adi2_midi_helper stdin pipe
+function M:sendParam(addr, index, val)
+    if not self.helperTask or not self.helperTask:isRunning() then
+        if not self:startHelper() then return false end
+    end
+    self.helperTask:setInput(string.format("SET %d %d %d\n", addr, index, math.floor(val + 0.5)))
+    return true
+end
+
+-- Request full state re-sync from ADI-2 DAC
+function M:requestAllSettings()
+    if self.helperTask and self.helperTask:isRunning() then
+        self.helperTask:setInput("SYNC\n")
+    else
+        self:startHelper()
+    end
 end
 
 -- Check if ADI-2 DAC is currently the active macOS audio output
@@ -302,21 +289,39 @@ function M:toggleMute()
     self:showHUD(addr)
 end
 
-function M:start()
-    self:connectMidi()
+function M:ensureHealthy()
+    if self.eventTap and not self.eventTap:isEnabled() then
+        self.eventTap:start()
+    end
+    if not self.helperTask or not self.helperTask:isRunning() then
+        self:startHelper()
+    end
+end
 
-    -- Reconnect automatically when USB devices change (e.g. KVM switch or DAC power cycle)
-    self.usbWatcher = hs.usb.watcher.new(function(data)
-        if data and data.productName and data.productName:match("^ADI%-2 DAC") then
-            if data.eventType == "added" then
-                hs.timer.doAfter(1.0, function() self:connectMidi() end)
-            elseif data.eventType == "removed" then
-                self.midiDevice = nil
-                self.midiDeviceName = nil
-            end
+function M:start()
+    self.stopping = false
+    self:startHelper()
+
+    -- Re-enable eventTap & re-sync MIDI state after macOS sleep/wake
+    self.sleepWatcher = hs.caffeinate.watcher.new(function(eventType)
+        if eventType == hs.caffeinate.watcher.systemDidWake
+            or eventType == hs.caffeinate.watcher.screensDidWake then
+            hs.timer.doAfter(1.5, function()
+                if not self.stopping then
+                    self:ensureHealthy()
+                    self:requestAllSettings()
+                end
+            end)
         end
     end)
-    self.usbWatcher:start()
+    self.sleepWatcher:start()
+
+    -- Periodic watchdog in case macOS disables CGEventTap on timeout
+    self.watchdogTimer = hs.timer.doEvery(30, function()
+        if not self.stopping then
+            self:ensureHealthy()
+        end
+    end)
 
     -- Intercept media keys (F10 Mute, F11 Vol Down, F12 Vol Up) when ADI-2 DAC is default output
     self.eventTap = hs.eventtap.new({ hs.eventtap.event.types.systemDefined }, function(event)
@@ -365,13 +370,18 @@ function M:start()
 end
 
 function M:stop()
+    self.stopping = true
+    if self.watchdogTimer then
+        self.watchdogTimer:stop()
+        self.watchdogTimer = nil
+    end
+    if self.sleepWatcher then
+        self.sleepWatcher:stop()
+        self.sleepWatcher = nil
+    end
     if self.eventTap then
         self.eventTap:stop()
         self.eventTap = nil
-    end
-    if self.usbWatcher then
-        self.usbWatcher:stop()
-        self.usbWatcher = nil
     end
     if self.hudTimer then
         self.hudTimer:stop()
@@ -381,9 +391,9 @@ function M:stop()
         self.hudCanvas:delete()
         self.hudCanvas = nil
     end
-    if self.midiDevice then
-        pcall(function() self.midiDevice:callback(nil) end)
-        self.midiDevice = nil
+    if self.helperTask then
+        pcall(function() self.helperTask:terminate() end)
+        self.helperTask = nil
         self.midiDeviceName = nil
     end
 end
